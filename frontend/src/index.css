@@ -1,0 +1,107 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@layer base {
+  :root {
+    /* Light theme: #F7F8FA bg, #FFFFFF surface, #171A21 text, #737B8C secondary, #117A49 accent (green), #E7EAF0 border */
+    --background: 220 23% 97.5%;
+    --foreground: 222 18% 11%;
+    --card: 0 0% 100%;
+    --card-foreground: 222 18% 11%;
+    --popover: 0 0% 100%;
+    --popover-foreground: 222 18% 11%;
+    --elevated: 220 23% 98.5%;
+    --primary: 152 76% 27%;
+    --primary-foreground: 0 0% 100%;
+    --secondary: 220 23% 95%;
+    --secondary-foreground: 222 18% 11%;
+    --muted: 220 23% 95%;
+    --muted-foreground: 221 10% 45%;
+    --accent: 150 55% 95%;
+    --accent-foreground: 152 76% 24%;
+    --destructive: 0 72% 50%;
+    --destructive-foreground: 0 0% 100%;
+    --border: 220 23% 92%;
+    --input: 220 20% 88%;
+    --ring: 152 76% 27%;
+    --radius: 0.625rem;
+
+    --positive: 152 65% 30%;
+    --positive-soft: 152 55% 94%;
+    --negative: 0 70% 46%;
+    --negative-soft: 0 80% 96%;
+    --warning: 32 92% 36%;
+    --warning-soft: 40 95% 93%;
+    --neutral: 221 10% 45%;
+    --neutral-soft: 220 23% 95%;
+
+    --chart-1: 151 76% 31%;
+    --chart-2: 248 63% 58%;
+    --chart-3: 41 100% 46%;
+    --chart-4: 280 50% 58%;
+  }
+
+  .dark {
+    /* Dark theme: #0B1020 bg, #121A2B surface, #192338 elevated, #F3F6FC text, #A0AAC0 secondary, #3ECF8E accent (green), #263149 border */
+    --background: 226 49% 8%;
+    --foreground: 220 60% 97%;
+    --card: 221 41% 12%;
+    --card-foreground: 220 60% 97%;
+    --popover: 221 38% 16%;
+    --popover-foreground: 220 60% 97%;
+    --elevated: 221 38% 16%;
+    --primary: 153 60% 53%;
+    --primary-foreground: 226 49% 8%;
+    --secondary: 221 38% 16%;
+    --secondary-foreground: 220 60% 97%;
+    --muted: 221 38% 16%;
+    --muted-foreground: 221 20% 69%;
+    --accent: 158 49% 14%;
+    --accent-foreground: 151 63% 69%;
+    --destructive: 0 80% 62%;
+    --destructive-foreground: 226 49% 8%;
+    --border: 221 32% 22%;
+    --input: 221 30% 26%;
+    --ring: 153 60% 53%;
+
+    --positive: 152 55% 55%;
+    --positive-soft: 152 40% 15%;
+    --negative: 0 85% 70%;
+    --negative-soft: 0 45% 17%;
+    --warning: 38 92% 62%;
+    --warning-soft: 38 50% 15%;
+    --neutral: 221 20% 69%;
+    --neutral-soft: 221 38% 16%;
+
+    --chart-1: 151 63% 39%;
+    --chart-2: 246 70% 72%;
+    --chart-3: 40 100% 39%;
+    --chart-4: 280 60% 72%;
+  }
+
+  * {
+    @apply border-border;
+  }
+  html {
+    -webkit-text-size-adjust: 100%;
+  }
+  body {
+    @apply bg-background text-foreground antialiased;
+    font-feature-settings: "cv11", "ss01";
+  }
+  .tabular {
+    font-variant-numeric: tabular-nums;
+  }
+  :focus-visible {
+    @apply outline-none ring-2 ring-ring ring-offset-2 ring-offset-background;
+  }
+  @media (prefers-reduced-motion: reduce) {
+    *,
+    *::before,
+    *::after {
+      animation-duration: 0.01ms !important;
+      transition-duration: 0.01ms !important;
+    }
+  }
+}
