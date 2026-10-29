@@ -9,6 +9,9 @@ os.environ["SUPABASE_ANON_KEY"] = ""
 os.environ["ANTHROPIC_API_KEY"] = ""
 os.environ["GEMINI_API_KEY"] = ""
 os.environ["ALPHA_VANTAGE_API_KEY"] = ""
+os.environ["GOAPI_API_KEY"] = ""
+os.environ["FINNHUB_API_KEY"] = ""
+os.environ["MARKET_DATA_PROVIDER"] = "alpha_vantage"  # keyless providers (yahoo) would always be "configured"
 os.environ["APP_ENV"] = "test"
 
 BASE_INPUT = {

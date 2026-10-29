@@ -154,3 +154,87 @@ def test_import_endpoint_accepts_pdf(client):
     files = {"file": ("lap.pdf", make_pdf(IDX_STATEMENT), "application/pdf")}
     r = client.post("/api/analysis/import", files=files)
     assert r.status_code == 200 and r.json()["current"]["total_assets"] == 299_675
+
+
+# --- OJK bank publication layout (based on a real monthly bank report) ---------------------
+
+def _chars(spec):
+    """spec: list of (text, x0, x1) tuples -> pdfplumber-like char dicts."""
+    return [{"text": t, "x0": a, "x1": b, "size": 7.6} for t, a, b in spec]
+
+
+def test_rebuild_line_joins_padded_numbers():
+    from app.services.pdf_import import rebuild_line
+
+    # "TOTAL ASET" + padding spaces + "1" touching ".596.962.424"  (real-world layout)
+    spec = [("T", 168.0, 172.6), ("O", 172.6, 178.5), ("T", 178.5, 183.1), ("A", 183.1, 188.2), ("L", 188.2, 193.0),
+            ("A", 195.1, 200.2), ("S", 200.2, 205.3), ("E", 205.3, 210.4), ("T", 210.4, 215.2),
+            (" ", 425.6, 427.7), (" ", 427.8, 429.9), ("1", 447.2, 451.4), (" ", 451.4, 451.4),
+            (".", 451.4, 453.5), ("5", 453.5, 457.7), ("9", 457.7, 461.9), ("6", 461.9, 466.1)]
+    assert rebuild_line(_chars(spec)) == "TOTAL ASET 1.596"
+
+
+def test_rebuild_line_keeps_real_gaps():
+    from app.services.pdf_import import rebuild_line
+
+    spec = [("2", 300.0, 304.0), ("c", 304.0, 308.0), ("5", 340.0, 344.0), ("0", 344.0, 348.0)]
+    assert rebuild_line(_chars(spec)) == "2c 50"
+
+
+BANK_PUBLICATION = [
+    ["PT BANK CONTOH Tbk", "LAPORAN POSISI KEUANGAN", "Pada tanggal 31 Agustus 2026", "(Dalam jutaan Rupiah)",
+     "ASET", "1. Kas 20.000.000", "2. Penempatan pada Bank Indonesia 60.000.000", "TOTAL ASET 1.596.962.424"],
+    ["PT BANK CONTOH Tbk", "(Dalam jutaan Rupiah)", "5. Liabilitas kepada Bank Indonesia -",
+     "TOTAL LIABILITAS 1.328.116.028", "TOTAL EKUITAS 268.846.396"],
+    ["PT BANK CONTOH Tbk", "LAPORAN LABA RUGI DAN PENGHASILAN KOMPREHENSIF LAIN",
+     "Periode Yang Berakhir Pada Tanggal 31 Agustus 2026", "(Dalam jutaan Rupiah)",
+     "1. Pendapatan Bunga 62.866.856", "2. Beban Bunga 9.042.446", "Pendapatan (Beban) Bunga Bersih 53.824.410",
+     "7. Pendapatan dividen 1.954.132", "8. Pendapatan komisi/provisi/fee dan administrasi 13.590.277",
+     "LABA (RUGI) PERIODE BERJALAN SEBELUM PAJAK 49.048.734", "LABA (RUGI) BERSIH PERIODE BERJALAN 40.173.327"],
+]
+
+
+def test_bank_publication_extraction():
+    out = parse_upload(make_pdf(BANK_PUBLICATION), "publikasi.pdf", MAX, MAX_PDF)
+    c = out["current"]
+    assert c["revenue"] == 62_866_856  # interest income, not "Pendapatan dividen"
+    assert c["net_income"] == 40_173_327  # not the pre-tax line
+    assert c["total_assets"] == 1_596_962_424
+    assert c["total_liabilities"] == 1_328_116_028 and c["total_equity"] == 268_846_396
+    rev_row = next(r for r in out["rows"] if r["field"] == "revenue")
+    assert any("pendapatan bunga" in m.lower() for m in rev_row["messages"])
+    d = out["detected"]
+    assert d["sector"] == "financials_bank" and d["company_name"] == "PT Bank Contoh Tbk"
+    assert d["fiscal_year"] == 2026 and d["basis"] is None and d["period_end"] == "2026-08-31"
+    assert "8 bulan" in d["period_note"]
+
+
+def test_interest_income_not_revenue_for_non_banks():
+    pages = [["PT INDUSTRI CONTOH TBK", "(Disajikan dalam jutaan Rupiah)", "Pendapatan bunga 1.200 900",
+              "7. Pendapatan dividen 500 400", "LABA TAHUN BERJALAN 3.000 2.500"]]
+    out = parse_upload(make_pdf(pages), "x.pdf", MAX, MAX_PDF)
+    assert "revenue" not in out["current"]
+    assert out["current"]["net_income"] == 3_000
+
+
+def test_individual_bank_report_derives_attributable_and_explains_gaps():
+    pages = [BANK_PUBLICATION[0][:4] + ["INDIVIDUAL"] + BANK_PUBLICATION[0][4:]] + BANK_PUBLICATION[1:]
+    out = parse_upload(make_pdf(pages), "BBCA_publikasi.pdf", MAX, MAX_PDF)
+    c = out["current"]
+    assert c["net_income_attributable"] == c["net_income"] == 40_173_327
+    assert c["equity_attributable"] == c["total_equity"] == 268_846_396
+    row = next(r for r in out["rows"] if r["field"] == "equity_attributable")
+    assert any("individual" in m.lower() for m in row["messages"])
+    w = " ".join(out["warnings"])
+    assert "tidak memuat laporan arus kas" in w          # OCF / capex explained, not "not found"
+    assert "hanya memuat satu periode" in w              # opening balances explained
+    assert "tidak diterapkan untuk bank" in w            # current assets/liabilities not needed
+    assert "Tidak ditemukan di PDF" not in w             # nothing left unexplained
+
+
+def test_consolidated_report_does_not_derive_attributable():
+    pages = [["PT INDUSTRI CONTOH TBK DAN ENTITAS ANAK", "(Disajikan dalam jutaan Rupiah)",
+              "LABA TAHUN BERJALAN 3.000 2.500", "JUMLAH EKUITAS 20.000 18.000 TOTAL EQUITY"]]
+    out = parse_upload(make_pdf(pages), "x.pdf", MAX, MAX_PDF)
+    assert "net_income_attributable" not in out["current"]
+    assert "equity_attributable" not in out["current"]

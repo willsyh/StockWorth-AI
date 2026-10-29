@@ -26,11 +26,13 @@ from pdfminer.pdfdocument import PDFPasswordIncorrect, PDFEncryptionError
 from app.core.errors import AppError
 from app.schemas.financials import FIELD_LABELS, NON_NEGATIVE_FIELDS, UNIT_MULTIPLIER, VALUE_FIELDS, Unit
 from app.services.importer import parse_number
+from app.services.metadata_detect import detect_from_text, ticker_from_file_name
 
 MAX_PAGES = 400
 SCAN_PAGES = 150  # statements are near the front of annual/interim reports
 TIME_BUDGET_SECONDS = 40
 MIN_CHARS_PER_PAGE = 25
+META_PAGES = 6  # cover + first statement pages carry company name and period
 
 # (field, include pattern, exclude pattern). Order matters: specific labels first.
 LINE_ITEMS: list[tuple[str, str, str | None]] = [
@@ -52,11 +54,14 @@ LINE_ITEMS: list[tuple[str, str, str | None]] = [
      r"(perolehan|pembelian|penambahan) aset tetap|"
      r"(acquisitions?|purchases?|additions?) of (fixed assets|property,? plant)", None),
     ("revenue",
-     r"^(pendapatan usaha|pendapatan bersih|penjualan bersih|pendapatan|jumlah pendapatan|"
-     r"revenues?|net revenues?|net sales|total revenues?)\b",
+     r"^(pendapatan usaha|pendapatan bersih|penjualan bersih|penjualan|jumlah pendapatan|pendapatan|"
+     r"revenues?|net revenues?|net sales|total revenues?|sales)"
+     r"(?=\s+(?:[\d(\-–—]|revenues?\b|net revenues?\b|net sales\b|sales\b)|$)",
      r"bunga|interest|lain|other|komprehensif|comprehensive|diterima|received|beban|expense"),
+    # Banks report interest income instead of revenue; used as revenue only for bank statements.
+    ("_interest_income", r"^(pendapatan bunga|interest income)\b", r"bersih|net|beban|expense|lain|other"),
     ("net_income",
-     r"^(laba|rugi|laba \(rugi\)) (bersih )?(tahun|periode) berjalan\b|"
+     r"^(laba|rugi|laba \(rugi\)|laba/rugi) (bersih |neto )?(tahun|periode) berjalan\b|"
      r"^(profit|loss|profit \(loss\)|net income) for the (year|period)\b",
      r"diatribusikan|attributable|komprehensif|comprehensive|per saham|per share|sebelum|before"),
 ]
@@ -77,8 +82,50 @@ IDR_PATTERN = re.compile(r"rupiah", re.I)
 NUM_TOKEN = re.compile(r"\(?-?\d{1,3}(?:[.,]\d{3})+(?:[.,]\d+)?\)?|\(?-?\d{4,}(?:[.,]\d+)?\)?|(?<![\w.,])[-–—](?![\w.,])")
 
 
+# Leading list markers such as "1.", "a.", "(b)", "iv." in OJK / IDX statement layouts.
+ENUM_PREFIX = re.compile(r"^(?:\(?\d{1,2}[.)]|\(?[a-z][.)]|[ivx]{1,4}[.)])\s+")
+# Stand-alone (non-consolidated) statements have no non-controlling interests.
+INDIVIDUAL_HINT = re.compile(
+    r"^individual$|laporan keuangan individual|\(individual\)|entitas induk saja|bank only|parent(?: entity)? only",
+    re.I | re.M,
+)
+CASH_FLOW_HINT = re.compile(r"arus kas|cash flows?", re.I)
+BANK_HINT = re.compile(r"\bpt\.?\s+bank\b|liabilitas kepada bank indonesia|penempatan pada bank indonesia", re.I)
+
+
 def _norm(line: str) -> str:
     return re.sub(r"\s+", " ", line).strip()
+
+
+def rebuild_line(chars: list[dict]) -> str:
+    """Rebuild a text line from character positions.
+
+    Some statements right-align numbers with padding space glyphs, and plain text extraction
+    then splits a number such as 1.596.962.424 into "1 .596.962.424". Here space glyphs are
+    ignored and a space is inserted only where there is a visible gap between characters.
+    """
+    glyphs = sorted((c for c in chars if c.get("text", "").strip()), key=lambda c: c["x0"])
+    if not glyphs:
+        return ""
+    parts = [glyphs[0]["text"]]
+    for prev, cur in zip(glyphs, glyphs[1:]):
+        size = min(prev.get("size") or 8.0, cur.get("size") or 8.0)
+        if cur["x0"] - prev["x1"] > max(0.8, 0.15 * size):
+            parts.append(" ")
+        parts.append(cur["text"])
+    return "".join(parts)
+
+
+def _page_lines(page) -> list[str]:
+    try:
+        lines = page.extract_text_lines(return_chars=True, strip=True)
+        rebuilt = [_norm(rebuild_line(ln.get("chars", []))) for ln in lines]
+        rebuilt = [ln for ln in rebuilt if ln]
+        if rebuilt:
+            return rebuilt
+    except Exception:
+        pass
+    return [_norm(ln) for ln in (page.extract_text() or "").splitlines() if ln.strip()]
 
 
 def _values_from_line(line: str) -> list[float | None]:
@@ -132,6 +179,28 @@ def _looks_scanned(text_chars: int, pages_read: int) -> bool:
     return pages_read > 0 and text_chars / pages_read < MIN_CHARS_PER_PAGE
 
 
+def _merge_detected(pages: list[tuple[int, str]], file_name: str) -> dict:
+    """First page that yields a value wins for each field; the ticker falls back to the file name."""
+    merged: dict = {"company_name": None, "ticker": None, "fiscal_year": None, "period": None, "basis": None,
+                    "period_end": None, "sector": None, "period_note": None, "sources": {}}
+    for page_no, text in pages:
+        d = detect_from_text(text, "", f"PDF hal. {page_no}")
+        for k in ("company_name", "ticker", "sector"):
+            if merged[k] is None and d.get(k):
+                merged[k], merged["sources"][k] = d[k], d["sources"][k]
+        if merged["basis"] is None and d["basis"]:
+            for k in ("fiscal_year", "period", "basis", "period_end"):
+                merged[k], merged["sources"][k] = d[k], d["sources"][k]
+            merged["period_note"] = None
+        elif merged["basis"] is None and merged["fiscal_year"] is None and d["fiscal_year"]:
+            # Period end found but its length isn't a supported annual/quarterly period.
+            merged["fiscal_year"], merged["sources"]["fiscal_year"] = d["fiscal_year"], d["sources"]["fiscal_year"]
+            merged["period_end"], merged["period_note"] = d["period_end"], d.get("period_note")
+    if merged["ticker"] is None and (t := ticker_from_file_name(file_name)):
+        merged["ticker"], merged["sources"]["ticker"] = t, "nama berkas"
+    return merged
+
+
 def parse_pdf(content: bytes, file_name: str) -> dict:
     if not content.startswith(b"%PDF"):
         raise AppError(415, "unsupported_file", "Berkas bukan PDF yang valid.")
@@ -142,6 +211,9 @@ def parse_pdf(content: bytes, file_name: str) -> dict:
         raise _open_error(exc) from exc
 
     found: dict[str, dict] = {}
+    meta_pages: list[tuple[int, str]] = []
+    saw_cash_flow = False
+    is_individual = False
     pending_attr = False
     text_chars = 0
     pages_read = 0
@@ -153,7 +225,8 @@ def parse_pdf(content: bytes, file_name: str) -> dict:
             if time.monotonic() - started > TIME_BUDGET_SECONDS:
                 break
             try:
-                text = page.extract_text() or ""
+                lines = _page_lines(page)
+                text = "\n".join(lines)
             except Exception as exc:
                 if _is_encryption_error(exc):
                     raise _open_error(exc) from exc
@@ -162,12 +235,13 @@ def parse_pdf(content: bytes, file_name: str) -> dict:
             text_chars += len(text.strip())
             if page_no == 5 and _looks_scanned(text_chars, pages_read):
                 break  # almost certainly a scanned document
+            if page_no <= META_PAGES:
+                meta_pages.append((page_no, text))
+            saw_cash_flow = saw_cash_flow or bool(CASH_FLOW_HINT.search(text))
+            is_individual = is_individual or bool(INDIVIDUAL_HINT.search(text))
             unit, currency = _page_unit(text), _page_currency(text)
-            for raw in text.splitlines():
-                line = _norm(raw)
-                if not line:
-                    continue
-                low = line.lower()
+            for line in lines:
+                low = ENUM_PREFIX.sub("", line.lower())
                 field = _template_key(line)
                 label_used = field
                 if field is None:
@@ -201,6 +275,30 @@ def parse_pdf(content: bytes, file_name: str) -> dict:
                 if all(f in found for f in ("net_income_attributable", "capital_expenditure", "current_assets")):
                     break
 
+    is_bank = any(BANK_HINT.search(t) for _, t in meta_pages)
+    interest = found.pop("_interest_income", None)
+    bank_revenue_note = None
+    if is_bank and "revenue" not in found and interest:
+        found["revenue"] = interest
+        bank_revenue_note = (
+            "Untuk bank, pendapatan diisi dengan pendapatan bunga (bruto); pendapatan non-bunga seperti komisi "
+            "tidak termasuk. Sesuaikan jika Anda memakai definisi lain."
+        )
+
+    # Stand-alone statements: everything belongs to the entity's own shareholders, so the
+    # "attributable to owners of the parent" figures equal the totals. Recorded on the row.
+    individual_note = (
+        "Laporan individual (tanpa entitas anak): tidak ada kepentingan non-pengendali, sehingga "
+        "nilainya sama dengan total."
+    )
+    derived_attr: set[str] = set()
+    if is_individual:
+        for attr_field, total_field in (("net_income_attributable", "net_income"),
+                                        ("equity_attributable", "total_equity")):
+            if attr_field not in found and total_field in found:
+                found[attr_field] = dict(found[total_field])
+                derived_attr.add(attr_field)
+
     if pages_read == 0 or _looks_scanned(text_chars, pages_read):
         raise AppError(
             422,
@@ -208,6 +306,10 @@ def parse_pdf(content: bytes, file_name: str) -> dict:
             "PDF ini tampaknya hasil pindaian (gambar) tanpa lapisan teks. Pembacaan OCR belum didukung; "
             "gunakan PDF asli dari situs BEI/emiten atau isi data secara manual.",
         )
+
+    detected = _merge_detected(meta_pages, file_name)
+    if detected["sector"] is None and is_bank:
+        detected["sector"], detected["sources"]["sector"] = "financials_bank", "isi laporan (format bank)"
 
     # Normalise everything to the most common detected unit.
     units = [v["unit"] for v in found.values() if v["unit"]]
@@ -230,6 +332,10 @@ def parse_pdf(content: bytes, file_name: str) -> dict:
         if not item:
             continue
         msgs = [f"Dari hal. {item['page']}: \"{item['label']}\"."]
+        if field == "revenue" and bank_revenue_note:
+            msgs.append(bank_revenue_note)
+        if field in derived_attr:
+            msgs.append(individual_note)
         scale = 1.0
         if target_unit and item["unit"] and item["unit"] != target_unit:
             scale = UNIT_MULTIPLIER[item["unit"]] / UNIT_MULTIPLIER[target_unit]
@@ -264,10 +370,30 @@ def parse_pdf(content: bytes, file_name: str) -> dict:
     # comparative column's closing balance, which the calculator already uses. Don't list them as missing.
     derived_begin = {"total_assets_begin": "total_assets", "total_equity_begin": "total_equity",
                      "equity_attributable_begin": "equity_attributable"}
+    # Explain absent items by why they are absent, instead of one undifferentiated list.
+    not_applicable = {"current_assets", "current_liabilities"} if is_bank else set()
+    not_in_report: dict[str, str] = {}
+    if not saw_cash_flow:
+        for f in ("operating_cash_flow", "capital_expenditure"):
+            not_in_report[f] = "PDF ini tidak memuat laporan arus kas"
+    if not previous:
+        for f in ("total_assets_begin", "total_equity_begin", "equity_attributable_begin"):
+            not_in_report[f] = "PDF ini hanya memuat satu periode (tanpa kolom pembanding/saldo awal)"
+    for f in ("weighted_average_shares", "shares_outstanding"):
+        not_in_report.setdefault(f, "jumlah saham biasanya ada di catatan laporan atau situs BEI")
     missing = [
         FIELD_LABELS[f] for f in VALUE_FIELDS
-        if f not in found and not (f in derived_begin and derived_begin[f] in previous)
+        if f not in found and f not in not_applicable and f not in not_in_report
+        and not (f in derived_begin and derived_begin[f] in previous)
     ]
+    absent_groups: dict[str, list[str]] = {}
+    for f, reason in not_in_report.items():
+        if f not in found:
+            absent_groups.setdefault(reason, []).append(FIELD_LABELS[f])
+    for reason, labels in absent_groups.items():
+        warnings.append(f"Isi manual jika diperlukan — {reason}: {', '.join(labels)}.")
+    if not_applicable:
+        warnings.append("Aset lancar dan liabilitas jangka pendek tidak diterapkan untuk bank, jadi tidak perlu diisi.")
     if any(f in derived_begin and derived_begin[f] in previous for f in VALUE_FIELDS):
         warnings.append(
             "Saldo awal periode tidak dibaca terpisah: untuk laporan tahunan diambil dari kolom pembanding. "
@@ -276,12 +402,13 @@ def parse_pdf(content: bytes, file_name: str) -> dict:
     if not current and not previous:
         warnings.append("Tidak ada akun laporan keuangan yang dikenali di PDF ini.")
     elif missing:
-        warnings.append("Tidak ditemukan di PDF (isi manual jika ada): " + ", ".join(missing) + ".")
+        warnings.append("Tidak ditemukan di PDF (periksa apakah ada dengan nama lain): " + ", ".join(missing) + ".")
     if pages_read < min(n_pages, SCAN_PAGES):
         warnings.append(f"Hanya {pages_read} halaman pertama yang dibaca.")
 
     errors = [f"Hal. {r['row']}: {m}" for r in rows if r["status"] == "error" for m in r["messages"][-1:]]
     return {
+        "detected": detected,
         "file_name": file_name,
         "file_type": "pdf",
         "sheet": None,

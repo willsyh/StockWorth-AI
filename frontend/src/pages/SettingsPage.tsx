@@ -12,6 +12,7 @@ import { PageHeader, errorMessage } from "@/components/ui/states";
 import { useTheme, type ThemePreference } from "@/app/theme";
 import { useAuth } from "@/app/auth";
 import { useHealth } from "@/hooks/queries";
+import { marketProviderLabel } from "@/lib/fields";
 import { supabase } from "@/lib/supabase";
 import { supabaseEnabled } from "@/lib/config";
 import { cn } from "@/lib/utils";
@@ -163,8 +164,8 @@ export default function SettingsPage() {
                     </p>
                     <p className="mt-0.5 text-sm text-muted-foreground">
                       {h.market_data?.configured
-                        ? `Penyedia: ${h.market_data.provider === "alpha_vantage" ? "Alpha Vantage" : h.market_data.provider}. ${h.market_data.coverage_note} Jika penyedia tidak punya data BEI, harga tetap diisi manual.`
-                        : "Harga saham diisi manual. Atur ALPHA_VANTAGE_API_KEY di backend untuk mengaktifkan tombol 'Ambil harga'."}
+                        ? `Penyedia: ${marketProviderLabel(h.market_data.provider)}. ${h.market_data.coverage_note} Harga diambil otomatis di langkah Data keuangan dan tetap bisa diubah.`
+                        : "Harga saham diisi manual. Atur MARKET_DATA_PROVIDER=yahoo (tanpa key) di backend agar harga terisi otomatis."}
                     </p>
                   </div>
                 </div>

@@ -38,14 +38,24 @@ class Settings(BaseSettings):
     max_pdf_upload_bytes: int = 20 * 1024 * 1024
 
     # Market data (share prices). Leave the key empty to keep price entry manual only.
-    market_data_provider: str = "alpha_vantage"
+    market_data_provider: str = "alpha_vantage"  # yahoo | finnhub | goapi | alpha_vantage
     alpha_vantage_api_key: str = ""
+    goapi_api_key: str = ""
+    finnhub_api_key: str = ""
     market_cache_seconds: int = 900
     market_rate_limit_per_hour: int = 20
 
     @property
     def market_data_configured(self) -> bool:
-        return self.market_data_provider == "alpha_vantage" and bool(self.alpha_vantage_api_key)
+        if self.market_data_provider == "yahoo":
+            return True  # no key needed (unofficial public endpoint)
+        if self.market_data_provider == "finnhub":
+            return bool(self.finnhub_api_key)
+        if self.market_data_provider == "goapi":
+            return bool(self.goapi_api_key)
+        if self.market_data_provider == "alpha_vantage":
+            return bool(self.alpha_vantage_api_key)
+        return False
 
     @property
     def cors_origin_list(self) -> list[str]:

@@ -42,6 +42,39 @@ HEADER_ALIASES = {
     "previous": {"periode_sebelumnya", "previous", "pembanding", "tahun_sebelumnya", "sebelumnya"},
 }
 META_KEYS = {"satuan": "unit", "unit": "unit", "mata_uang": "currency", "currency": "currency"}
+# Optional company / period rows. Empty values are ignored; filled values pre-fill the wizard.
+COMPANY_META_KEYS = {
+    "kode_saham": "ticker", "ticker": "ticker",
+    "nama_perusahaan": "company_name", "company_name": "company_name",
+    "tahun_fiskal": "fiscal_year", "fiscal_year": "fiscal_year",
+    "jenis_laporan": "basis", "basis": "basis",
+    "periode": "period", "period": "period",
+}
+BASIS_ALIASES = {"tahunan": "annual", "annual": "annual", "kumulatif": "ytd", "ytd": "ytd",
+                 "kuartalan": "quarterly", "per kuartal": "quarterly", "quarterly": "quarterly"}
+
+
+def _company_meta(key: str, raw_value) -> tuple[object | None, str | None]:
+    """Validate one optional company/period template row. Returns (value, error)."""
+    if raw_value is None or str(raw_value).strip() == "":
+        return None, None
+    raw = str(raw_value).strip()
+    if key == "ticker":
+        t = raw.upper()
+        return (t, None) if re.fullmatch(r"[A-Z]{4}", t) else (None, "Kode saham harus 4 huruf, contoh: BBCA.")
+    if key == "company_name":
+        name = " ".join(raw.split())
+        return (name, None) if 2 <= len(name) <= 160 else (None, "Nama perusahaan 2–160 karakter.")
+    if key == "fiscal_year":
+        y = raw[:-2] if raw.endswith(".0") else raw
+        return (int(y), None) if y.isdigit() and 1990 <= int(y) <= 2100 else (None, "Tahun fiskal harus 4 digit (1990–2100).")
+    if key == "basis":
+        b = BASIS_ALIASES.get(raw.lower())
+        return (b, None) if b else (None, "Jenis laporan: tahunan, kumulatif, atau kuartalan.")
+    if key == "period":
+        q = raw.upper()
+        return (q, None) if q in ("FY", "Q1", "Q2", "Q3", "Q4") else (None, "Periode: FY, Q1, Q2, Q3, atau Q4.")
+    return None, None
 _LABEL_TO_FIELD = {v.lower(): k for k, v in FIELD_LABELS.items()}
 
 
@@ -167,6 +200,8 @@ def _process_rows(rows: list[tuple[int, list[_Cell]]], file_name: str, file_type
     previous: dict[str, float] = {}
     cell_refs: dict[str, str] = {}
     meta: dict[str, str] = {}
+    company: dict[str, object] = {}
+    company_refs: dict[str, str] = {}
     seen: dict[str, int] = {}
     file_warnings: list[str] = []
     ambiguous: list[str] = []
@@ -186,6 +221,21 @@ def _process_rows(rows: list[tuple[int, list[_Cell]]], file_name: str, file_type
         if not code:
             results.append(RowResult(row=row_no, code="", field=None, label=label, status="error",
                                      messages=["Kolom kode kosong."]))
+            continue
+
+        company_key = COMPANY_META_KEYS.get(code.lower())
+        if company_key:
+            value, err = _company_meta(company_key, cur_cell.value if cur_cell else None)
+            if value is None and err is None:
+                continue  # optional row left empty
+            r = RowResult(row=row_no, code=code, field=None, label="Info perusahaan")
+            if err:
+                r.status, r.messages = "error", [err]
+            else:
+                company[company_key] = value
+                company_refs[company_key] = cur_cell.ref
+                r.messages.append(f"Terbaca: {value}.")
+            results.append(r)
             continue
 
         meta_key = META_KEYS.get(code.lower())
@@ -280,7 +330,19 @@ def _process_rows(rows: list[tuple[int, list[_Cell]]], file_name: str, file_type
     warnings = file_warnings + [
         f"Baris {r.row}: {x}" for r in results if r.status == "warning" for x in r.messages
     ]
+    from app.services.metadata_detect import ticker_from_file_name
+
+    detected = {"company_name": None, "ticker": None, "fiscal_year": None, "period": None, "basis": None,
+                "period_end": None, "sources": {}}
+    for k, v in company.items():
+        detected[k] = v
+        detected["sources"][k] = company_refs[k]
+    if detected["basis"] == "annual" and detected["period"] is None:
+        detected["period"] = "FY"
+    if detected["ticker"] is None and (t := ticker_from_file_name(file_name)):
+        detected["ticker"], detected["sources"]["ticker"] = t, "nama berkas"
     return {
+        "detected": detected,
         "file_name": file_name,
         "file_type": file_type,
         "sheet": sheet,
@@ -441,7 +503,12 @@ TEMPLATE_HEADER = ["kode", "keterangan", "periode_berjalan", "periode_sebelumnya
 
 
 def template_rows() -> list[list[str]]:
-    rows = [["satuan", "Satuan nilai: unit / ribu / juta / miliar", "juta", ""],
+    rows = [["kode_saham", "Opsional — kode saham BEI, 4 huruf (mis. BBCA)", "", ""],
+            ["nama_perusahaan", "Opsional — nama perusahaan (mis. PT Bank Central Asia Tbk)", "", ""],
+            ["tahun_fiskal", "Opsional — tahun fiskal periode berjalan (mis. 2024)", "", ""],
+            ["jenis_laporan", "Opsional — tahunan / kumulatif / kuartalan", "", ""],
+            ["periode", "Opsional — FY, Q1, Q2, Q3, atau Q4", "", ""],
+            ["satuan", "Satuan nilai: unit / ribu / juta / miliar", "juta", ""],
             ["mata_uang", "Mata uang laporan: IDR / USD", "IDR", ""]]
     rows += [[f, FIELD_LABELS[f], "", ""] for f in VALUE_FIELDS]
     return rows

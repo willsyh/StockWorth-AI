@@ -166,3 +166,184 @@ def test_forged_or_edited_provider_price_downgraded(client, base_input, monkeypa
                             "price_provider": "fake"}
     m = client.post("/api/analysis", json=base_input).json()["input"]["market"]
     assert m["price_origin"] == "manual" and m["price_provider"] is None
+
+
+# --- GoAPI.id ----------------------------------------------------------------------------
+
+from app.services.market_data import GoAPIProvider  # noqa: E402
+
+
+def fake_goapi(status=200, body=None, capture=None):
+    def _get(url, params=None, headers=None, timeout=None):
+        if capture is not None:
+            capture.update(url=url, params=params, headers=headers)
+        return httpx.Response(status, json=body, request=httpx.Request("GET", url))
+
+    return _get
+
+
+GOAPI_OK = {"status": "success", "message": "ok", "data": [
+    {"date": TODAY, "symbol": "BBCA", "open": 9100, "high": 9200, "low": 9050, "close": 9150, "volume": 1, "change": 50}]}
+
+
+def test_goapi_quote(monkeypatch):
+    cap = {}
+    monkeypatch.setattr(market_data.httpx, "get", fake_goapi(body=GOAPI_OK, capture=cap))
+    q = GoAPIProvider("k").get_quote("BBCA")
+    assert q.price == 9150.0 and q.currency == "IDR" and q.trading_date == TODAY and q.provider == "goapi"
+    assert cap["params"] == {"symbols": "BBCA"} and cap["headers"]["X-API-KEY"] == "k"
+
+
+def test_goapi_nested_results_shape(monkeypatch):
+    body = {"status": "success", "data": {"results": GOAPI_OK["data"]}}
+    monkeypatch.setattr(market_data.httpx, "get", fake_goapi(body=body))
+    assert GoAPIProvider("k").get_quote("BBCA").price == 9150.0
+
+
+@pytest.mark.parametrize("body", [
+    {"status": "success", "data": []},
+    {"status": "success", "data": [{"date": TODAY, "symbol": "BBRI", "close": 4000}]},  # other symbol only
+    {"status": "error", "message": "symbol not found"},
+])
+def test_goapi_unavailable(monkeypatch, body):
+    monkeypatch.setattr(market_data.httpx, "get", fake_goapi(body=body))
+    with pytest.raises(MarketDataUnavailable):
+        GoAPIProvider("k").get_quote("BBCA")
+
+
+@pytest.mark.parametrize("close", [0, -1, "abc", None])
+def test_goapi_invalid_price(monkeypatch, close):
+    body = {"status": "success", "data": [{"date": TODAY, "symbol": "BBCA", "close": close}]}
+    monkeypatch.setattr(market_data.httpx, "get", fake_goapi(body=body))
+    with pytest.raises(MarketDataUnavailable):
+        GoAPIProvider("k").get_quote("BBCA")
+
+
+@pytest.mark.parametrize("status,code", [(401, 503), (429, 429), (500, 503)])
+def test_goapi_http_errors(monkeypatch, status, code):
+    monkeypatch.setattr(market_data.httpx, "get", fake_goapi(status, {"status": "error", "message": "x"}))
+    with pytest.raises(MarketDataError) as e:
+        GoAPIProvider("secret").get_quote("BBCA")
+    assert e.value.status_code == code and "secret" not in str(e.value)
+
+
+def test_goapi_selected_by_settings():
+    from app.core.config import Settings
+    from app.services.market_data import get_market_provider
+
+    s = Settings(_env_file=None, market_data_provider="goapi", goapi_api_key="g")
+    assert isinstance(get_market_provider(s), GoAPIProvider)
+    assert get_market_provider(Settings(_env_file=None, market_data_provider="goapi", goapi_api_key="")) is None
+
+
+# --- Finnhub -----------------------------------------------------------------------------
+
+from app.services.market_data import FinnhubProvider  # noqa: E402
+
+
+def fake_finnhub(status=200, body=None, capture=None):
+    def _get(url, params=None, headers=None, timeout=None):
+        if capture is not None:
+            capture.update(url=url, params=params, headers=headers)
+        return httpx.Response(status, json=body, request=httpx.Request("GET", url))
+
+    return _get
+
+
+def _ts_today_jakarta():
+    from datetime import datetime, timedelta, timezone
+
+    return int(datetime.now(timezone(timedelta(hours=7))).replace(hour=9, minute=0, second=0).timestamp())
+
+
+def test_finnhub_quote(monkeypatch):
+    cap = {}
+    body = {"c": 9150, "d": 50, "dp": 0.55, "h": 9200, "l": 9050, "o": 9100, "pc": 9100, "t": _ts_today_jakarta()}
+    monkeypatch.setattr(market_data.httpx, "get", fake_finnhub(body=body, capture=cap))
+    q = FinnhubProvider("k").get_quote("BBCA")
+    assert q.price == 9150.0 and q.provider_symbol == "BBCA.JK" and q.currency == "IDR" and q.provider == "finnhub"
+    assert cap["params"] == {"symbol": "BBCA.JK"} and cap["headers"]["X-Finnhub-Token"] == "k"
+
+
+def test_finnhub_zero_response_is_unavailable(monkeypatch):
+    body = {"c": 0, "d": None, "dp": None, "h": 0, "l": 0, "o": 0, "pc": 0, "t": 0}
+    monkeypatch.setattr(market_data.httpx, "get", fake_finnhub(body=body))
+    with pytest.raises(MarketDataUnavailable, match="tidak memiliki data"):
+        FinnhubProvider("k").get_quote("BBCA")
+
+
+def test_finnhub_plan_without_access(monkeypatch):
+    monkeypatch.setattr(market_data.httpx, "get", fake_finnhub(403, {"error": "You don't have access to this resource."}))
+    with pytest.raises(MarketDataUnavailable, match="paket berbayar"):
+        FinnhubProvider("k").get_quote("BBCA")
+
+
+@pytest.mark.parametrize("status,code", [(401, 503), (429, 429), (502, 503)])
+def test_finnhub_http_errors(monkeypatch, status, code):
+    monkeypatch.setattr(market_data.httpx, "get", fake_finnhub(status, {"error": "x"}))
+    with pytest.raises(MarketDataError) as e:
+        FinnhubProvider("secret").get_quote("BBCA")
+    assert e.value.status_code == code and "secret" not in str(e.value)
+
+
+def test_finnhub_selected_by_settings():
+    from app.core.config import Settings
+    from app.services.market_data import get_market_provider
+
+    assert isinstance(get_market_provider(Settings(_env_file=None, market_data_provider="finnhub", finnhub_api_key="f")),
+                      FinnhubProvider)
+
+
+# --- Yahoo Finance ------------------------------------------------------------------------
+
+from app.services.market_data import YahooFinanceProvider  # noqa: E402
+
+
+def _yahoo_body(**meta_overrides):
+    meta = {"currency": "IDR", "symbol": "BBCA.JK", "exchangeName": "JKT", "instrumentType": "EQUITY",
+            "regularMarketPrice": 4940.0, "regularMarketTime": _ts_today_jakarta()}
+    meta.update(meta_overrides)
+    return {"chart": {"result": [{"meta": meta}], "error": None}}
+
+
+def test_yahoo_quote(monkeypatch):
+    cap = {}
+    monkeypatch.setattr(market_data.httpx, "get", fake_finnhub(body=_yahoo_body(), capture=cap))
+    q = YahooFinanceProvider().get_quote("BBCA")
+    assert q.price == 4940.0 and q.provider == "yahoo" and q.provider_symbol == "BBCA.JK" and q.currency == "IDR"
+    assert cap["url"].endswith("/BBCA.JK")
+
+
+@pytest.mark.parametrize("override", [
+    {"currency": "USD"},          # e.g. a US listing
+    {"exchangeName": "NYQ"},
+    {"symbol": "BBCA"},           # bare symbol = US ETF on Yahoo
+    {"instrumentType": "ETF"},
+    {"regularMarketPrice": 0},
+    {"regularMarketPrice": None},
+])
+def test_yahoo_rejects_non_idx_or_invalid(monkeypatch, override):
+    monkeypatch.setattr(market_data.httpx, "get", fake_finnhub(body=_yahoo_body(**override)))
+    with pytest.raises(MarketDataUnavailable):
+        YahooFinanceProvider().get_quote("BBCA")
+
+
+def test_yahoo_not_found(monkeypatch):
+    body = {"chart": {"result": None, "error": {"code": "Not Found", "description": "No data found"}}}
+    monkeypatch.setattr(market_data.httpx, "get", fake_finnhub(404, body))
+    with pytest.raises(MarketDataUnavailable, match="tidak menemukan"):
+        YahooFinanceProvider().get_quote("ZZZZ")
+
+
+def test_yahoo_rate_limited(monkeypatch):
+    monkeypatch.setattr(market_data.httpx, "get", fake_finnhub(429, {}))
+    with pytest.raises(MarketDataError) as e:
+        YahooFinanceProvider().get_quote("BBCA")
+    assert e.value.status_code == 429
+
+
+def test_yahoo_needs_no_key():
+    from app.core.config import Settings
+    from app.services.market_data import get_market_provider
+
+    assert isinstance(get_market_provider(Settings(_env_file=None, market_data_provider="yahoo")), YahooFinanceProvider)

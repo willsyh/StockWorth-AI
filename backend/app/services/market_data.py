@@ -16,7 +16,7 @@ import math
 import threading
 import time
 from dataclasses import asdict, dataclass
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Protocol
 
 import httpx
@@ -136,10 +136,200 @@ class AlphaVantageProvider:
         )
 
 
+class GoAPIProvider:
+    """GoAPI.id — IDX-only price API (https://goapi.io). Prices are delayed 3–10 minutes
+    according to the provider's documentation."""
+
+    name = "goapi"
+    label = "GoAPI.id"
+    BASE_URL = "https://api.goapi.io/stock/idx/prices"
+
+    def __init__(self, api_key: str, timeout: float = 15.0):
+        self._key = api_key
+        self._timeout = timeout
+
+    def get_quote(self, ticker: str) -> Quote:
+        try:
+            resp = httpx.get(self.BASE_URL, params={"symbols": ticker},
+                             headers={"X-API-KEY": self._key, "Accept": "application/json"}, timeout=self._timeout)
+        except httpx.HTTPError as exc:
+            raise MarketDataError("Penyedia data harga tidak dapat dihubungi.") from exc
+        if resp.status_code in (401, 403):
+            raise MarketDataError("Kunci API GoAPI tidak valid atau tidak punya akses.")
+        if resp.status_code == 429:
+            raise MarketDataError("Batas penggunaan GoAPI tercapai. Coba lagi nanti.", status_code=429)
+        if resp.status_code != 200:
+            raise MarketDataError(f"Penyedia data harga mengembalikan galat ({resp.status_code}).")
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise MarketDataError("Respons penyedia data harga tidak valid.") from exc
+        if str(body.get("status", "")).lower() != "success":
+            msg = str(body.get("message", ""))
+            if "limit" in msg.lower() or "quota" in msg.lower():
+                raise MarketDataError("Batas penggunaan GoAPI tercapai. Coba lagi nanti.", status_code=429)
+            raise MarketDataUnavailable("GoAPI tidak mengembalikan data harga untuk kode ini.")
+        data = body.get("data")
+        # The documented shape is a list; some responses nest it under "results".
+        items = data.get("results") if isinstance(data, dict) else data
+        item = next((i for i in (items or []) if str(i.get("symbol", "")).upper() == ticker), None)
+        if item is None:
+            raise MarketDataUnavailable(f"GoAPI tidak memiliki harga untuk {ticker}. Periksa kode saham.")
+        try:
+            price = float(item["close"])
+            trading_day = date.fromisoformat(str(item["date"])[:10])
+        except (KeyError, TypeError, ValueError) as exc:
+            raise MarketDataUnavailable("Data harga dari penyedia tidak lengkap.") from exc
+        if not math.isfinite(price) or price <= 0:
+            raise MarketDataUnavailable("Harga dari penyedia tidak valid.")
+        if trading_day > date.today():
+            raise MarketDataUnavailable("Tanggal harga dari penyedia tidak valid.")
+        return Quote(
+            ticker=ticker,
+            provider=self.name,
+            provider_symbol=f"{ticker}{IDX_SUFFIX}",  # canonical IDX listing id (GoAPI only covers IDX)
+            price=price,
+            currency="IDR",
+            trading_date=trading_day.isoformat(),
+            fetched_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            note="Harga terakhir dari GoAPI.id; tertunda sekitar 3–10 menit dan bukan harga real-time.",
+        )
+
+
+class FinnhubProvider:
+    """Finnhub (https://finnhub.io) quote endpoint for the IDX listing TICKER.JK.
+
+    Finnhub returns all-zero fields for symbols it has no data for, and HTTP 403 when the
+    account's plan does not include the exchange; both are reported as unavailable.
+    """
+
+    name = "finnhub"
+    label = "Finnhub"
+    BASE_URL = "https://finnhub.io/api/v1/quote"
+    JAKARTA = timezone(timedelta(hours=7))
+
+    def __init__(self, api_key: str, timeout: float = 15.0):
+        self._key = api_key
+        self._timeout = timeout
+
+    def get_quote(self, ticker: str) -> Quote:
+        symbol = f"{ticker}{IDX_SUFFIX}"
+        try:
+            resp = httpx.get(self.BASE_URL, params={"symbol": symbol},
+                             headers={"X-Finnhub-Token": self._key}, timeout=self._timeout)
+        except httpx.HTTPError as exc:
+            raise MarketDataError("Penyedia data harga tidak dapat dihubungi.") from exc
+        if resp.status_code == 401:
+            raise MarketDataError("Kunci API Finnhub tidak valid.")
+        if resp.status_code == 403:
+            raise MarketDataUnavailable(
+                f"Paket Finnhub Anda tidak mencakup harga {symbol} (Bursa Efek Indonesia). "
+                "Harga saham di luar AS umumnya memerlukan paket berbayar; isi harga secara manual."
+            )
+        if resp.status_code == 429:
+            raise MarketDataError("Batas penggunaan Finnhub tercapai. Coba lagi nanti.", status_code=429)
+        if resp.status_code != 200:
+            raise MarketDataError(f"Penyedia data harga mengembalikan galat ({resp.status_code}).")
+        try:
+            body = resp.json()
+        except ValueError as exc:
+            raise MarketDataError("Respons penyedia data harga tidak valid.") from exc
+        if not isinstance(body, dict) or "error" in body:
+            raise MarketDataUnavailable(f"Finnhub tidak menyediakan harga untuk {symbol}.")
+        price, ts = body.get("c"), body.get("t")
+        if not isinstance(price, (int, float)) or not isinstance(ts, (int, float)) or price <= 0 or ts <= 0:
+            raise MarketDataUnavailable(
+                f"Finnhub tidak memiliki data harga untuk {symbol} (Bursa Efek Indonesia). Isi harga secara manual."
+            )
+        if not math.isfinite(price):
+            raise MarketDataUnavailable("Harga dari penyedia tidak valid.")
+        trading_day = datetime.fromtimestamp(ts, tz=self.JAKARTA).date()
+        if trading_day > datetime.now(self.JAKARTA).date():
+            raise MarketDataUnavailable("Tanggal harga dari penyedia tidak valid.")
+        return Quote(
+            ticker=ticker,
+            provider=self.name,
+            provider_symbol=symbol,
+            price=float(price),
+            currency="IDR",  # the .JK listing trades in rupiah
+            trading_date=trading_day.isoformat(),
+            fetched_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            note="Harga terakhir dari Finnhub untuk listing BEI; bisa tertunda dan bukan harga real-time.",
+        )
+
+
+class YahooFinanceProvider:
+    """Yahoo Finance public chart endpoint (unofficial; no key, no SLA, not for commercial use).
+
+    Only accepted when Yahoo confirms the listing is TICKER.JK on the Jakarta exchange in IDR.
+    """
+
+    name = "yahoo"
+    label = "Yahoo Finance"
+    BASE_URL = "https://query1.finance.yahoo.com/v8/finance/chart/"
+    JAKARTA = timezone(timedelta(hours=7))
+    HEADERS = {"User-Agent": "Mozilla/5.0 (compatible; StockWorthAI/0.1)", "Accept": "application/json"}
+
+    def __init__(self, timeout: float = 15.0):
+        self._timeout = timeout
+
+    def get_quote(self, ticker: str) -> Quote:
+        symbol = f"{ticker}{IDX_SUFFIX}"
+        try:
+            resp = httpx.get(self.BASE_URL + symbol, params={"range": "5d", "interval": "1d"},
+                             headers=self.HEADERS, timeout=self._timeout)
+        except httpx.HTTPError as exc:
+            raise MarketDataError("Yahoo Finance tidak dapat dihubungi.") from exc
+        if resp.status_code == 404:
+            raise MarketDataUnavailable(f"Yahoo Finance tidak menemukan {symbol}. Periksa kode saham.")
+        if resp.status_code == 429:
+            raise MarketDataError("Yahoo Finance membatasi permintaan. Coba lagi nanti.", status_code=429)
+        if resp.status_code != 200:
+            raise MarketDataError(f"Yahoo Finance mengembalikan galat ({resp.status_code}).")
+        try:
+            chart = resp.json().get("chart") or {}
+        except ValueError as exc:
+            raise MarketDataError("Respons Yahoo Finance tidak valid.") from exc
+        results = chart.get("result") or []
+        if chart.get("error") or not results:
+            raise MarketDataUnavailable(f"Yahoo Finance tidak memiliki data untuk {symbol}.")
+        meta = results[0].get("meta") or {}
+        if str(meta.get("symbol", "")).upper() != symbol:
+            raise MarketDataUnavailable("Simbol pada respons tidak cocok dengan simbol yang diminta.")
+        if str(meta.get("currency", "")).upper() != "IDR" or str(meta.get("exchangeName", "")).upper() != "JKT":
+            raise MarketDataUnavailable(
+                f"Data {symbol} dari Yahoo Finance bukan listing Bursa Efek Indonesia dalam IDR; tidak digunakan."
+            )
+        if meta.get("instrumentType") not in (None, "EQUITY"):
+            raise MarketDataUnavailable(f"{symbol} bukan saham biasa.")
+        price, ts = meta.get("regularMarketPrice"), meta.get("regularMarketTime")
+        if not isinstance(price, (int, float)) or not isinstance(ts, (int, float)) or not math.isfinite(price)                 or price <= 0 or ts <= 0:
+            raise MarketDataUnavailable("Harga dari Yahoo Finance tidak valid.")
+        trading_day = datetime.fromtimestamp(ts, tz=self.JAKARTA).date()
+        if trading_day > datetime.now(self.JAKARTA).date():
+            raise MarketDataUnavailable("Tanggal harga dari Yahoo Finance tidak valid.")
+        return Quote(
+            ticker=ticker,
+            provider=self.name,
+            provider_symbol=symbol,
+            price=float(price),
+            currency="IDR",
+            trading_date=trading_day.isoformat(),
+            fetched_at=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+            note="Harga terakhir dari Yahoo Finance (sumber tidak resmi); bisa tertunda dan bukan harga real-time.",
+        )
+
+
 def get_market_provider(settings: Settings) -> MarketDataProvider | None:
-    if settings.market_data_configured:
-        return AlphaVantageProvider(settings.alpha_vantage_api_key)
-    return None
+    if not settings.market_data_configured:
+        return None
+    if settings.market_data_provider == "yahoo":
+        return YahooFinanceProvider()
+    if settings.market_data_provider == "finnhub":
+        return FinnhubProvider(settings.finnhub_api_key)
+    if settings.market_data_provider == "goapi":
+        return GoAPIProvider(settings.goapi_api_key)
+    return AlphaVantageProvider(settings.alpha_vantage_api_key)
 
 
 class QuoteCache:

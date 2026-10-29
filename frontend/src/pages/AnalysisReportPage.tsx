@@ -22,7 +22,7 @@ import { InsightsPanel } from "@/components/analysis/InsightsPanel";
 import { TrendCharts, buildTrendPoints } from "@/components/charts/TrendCharts";
 import { useAnalyses, useAnalysis, useDeleteAnalysis } from "@/hooks/queries";
 import { ApiError } from "@/lib/api";
-import { sectorLabel } from "@/lib/fields";
+import { marketProviderLabel, sectorLabel } from "@/lib/fields";
 import { formatDate, formatDateTime, formatFixed } from "@/lib/format";
 import type { AnalysisRecord, DimensionScore, Finding, FindingSection, ScoreResult } from "@/types/api";
 
@@ -179,7 +179,7 @@ function Report({ rec }: { rec: AnalysisRecord }) {
                 <dd>
                   Harga per {formatDate(rec.input.market.share_price_date)}{" "}
                   {rec.input.market.price_origin === "provider"
-                    ? `(dari ${rec.input.market.price_provider === "alpha_vantage" ? "Alpha Vantage" : rec.input.market.price_provider}, ${rec.input.market.price_provider_symbol})`
+                    ? `(dari ${marketProviderLabel(rec.input.market.price_provider)}, ${rec.input.market.price_provider_symbol})`
                     : "(diisi pengguna)"}
                 </dd>
               </div>

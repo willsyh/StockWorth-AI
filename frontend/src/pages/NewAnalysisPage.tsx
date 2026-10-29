@@ -1,10 +1,11 @@
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { Controller, useForm, type FieldPath } from "react-hook-form";
 import { zodResolver } from "@hookform/resolvers/zod";
 import { useMutation } from "@tanstack/react-query";
 import { toast } from "sonner";
 import {
+  AlertTriangle,
   ArrowLeft,
   ArrowRight,
   Check,
@@ -43,8 +44,8 @@ import type { AnalysisInput, ImportPreview, SourceInfo, ValueField } from "@/typ
 type Method = "manual" | ImportKind;
 
 const STEPS = [
+  { title: "Sumber data", description: "Manual atau unggah" },
   { title: "Perusahaan", description: "Emiten & periode" },
-  { title: "Metode input", description: "Manual atau impor" },
   { title: "Data keuangan", description: "Laporan & harga" },
   { title: "Tinjau", description: "Periksa & simpan" },
 ];
@@ -160,21 +161,34 @@ export default function NewAnalysisPage() {
   const priceStillFetched =
     fetchedPrice !== null && parseIdNumber(watchedPrice) === fetchedPrice.price && watchedPriceDate === fetchedPrice.trading_date;
 
-  const fetchPrice = () => {
+  const fetchPrice = (opts: { auto?: boolean } = {}) => {
     const t = getValues("ticker").trim().toUpperCase();
     if (!/^[A-Z]{4}$/.test(t)) {
-      toast.error("Isi kode saham 4 huruf di langkah 1 terlebih dahulu.");
+      if (!opts.auto) toast.error("Isi kode saham 4 huruf di langkah Perusahaan terlebih dahulu.");
       return;
     }
     quote.mutate(t, {
       onSuccess: (q) => {
         setValue("share_price", toInputString(q.price), { shouldValidate: true });
         setValue("share_price_date", q.trading_date, { shouldValidate: true });
-        setValue("price_source", `${q.provider_label} (${q.provider_symbol}), penutupan ${q.trading_date}`);
+        setValue("price_source", `${q.provider_label} (${q.provider_symbol}), harga terakhir ${q.trading_date}`);
         setFetchedPrice({ ...q, label: q.provider_label });
+        if (opts.auto) toast.success(`Harga ${t} terisi otomatis dari ${q.provider_label}.`);
       },
     });
   };
+
+  // Fetch the latest price automatically on entering the financial-data step, once per ticker,
+  // and only when the price field is still empty (a price the user typed is never overwritten).
+  const autoFetchedFor = useRef<string | null>(null);
+  useEffect(() => {
+    if (step !== 2 || !marketConfigured) return;
+    const t = getValues("ticker").trim().toUpperCase();
+    if (!/^[A-Z]{4}$/.test(t) || getValues("share_price").trim() !== "" || autoFetchedFor.current === t) return;
+    autoFetchedFor.current = t;
+    fetchPrice({ auto: true });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [step, marketConfigured]);
   const create = useCreateAnalysis();
 
   const unitText = `${UNITS.find((u) => u.value === unit)?.label.toLowerCase()} ${currency}`;
@@ -191,7 +205,22 @@ export default function NewAnalysisPage() {
     return {
       method: imported.preview.file_type,
       file_name: imported.preview.file_name,
-      cell_refs: imported.preview.cell_refs,
+      cell_refs: {
+        ...imported.preview.cell_refs,
+        // Where pre-filled company/period info came from (kept only if the user didn't change it).
+        ...Object.fromEntries(
+          (
+            [
+              ["ticker", values.ticker.trim().toUpperCase(), "company.ticker"],
+              ["company_name", values.name.trim(), "company.name"],
+              ["fiscal_year", Number(values.fiscal_year), "statement.fiscal_year"],
+              ["basis", values.basis, "statement.basis"],
+            ] as const
+          )
+            .filter(([k, v]) => imported.preview.detected?.[k] != null && imported.preview.detected[k] === v)
+            .map(([k, , ref]) => [ref, imported.preview.detected!.sources[k] ?? ""]),
+        ),
+      },
       edited_after_import: edited,
     };
   };
@@ -213,25 +242,92 @@ export default function NewAnalysisPage() {
     if (prevCount > 0) setValue("include_previous", true);
     if (preview.unit) setValue("unit", preview.unit);
     if (preview.currency) setValue("currency", preview.currency);
+    const d = preview.detected;
+    const filled: string[] = [];
+    if (d?.ticker) {
+      setValue("ticker", d.ticker, { shouldDirty: true });
+      filled.push("kode saham");
+    }
+    if (d?.company_name) {
+      setValue("name", d.company_name, { shouldDirty: true });
+      filled.push("nama");
+    }
+    if (d?.fiscal_year) {
+      setValue("fiscal_year", String(d.fiscal_year), { shouldDirty: true });
+      filled.push("tahun");
+    }
+    if (d?.basis) {
+      setValue("basis", d.basis);
+      setValue("period", d.period ?? (d.basis === "annual" ? "FY" : "Q3"));
+      filled.push("periode");
+    }
+    if (d?.sector) {
+      setValue("sector", d.sector);
+      filled.push("sektor");
+    }
+    syncPreviousPeriod();
     setImported({ preview, values });
-    toast.success(`${Object.keys(values).length} nilai diterapkan dari ${preview.file_name}.`);
-    setStep(2);
+    // New report uploaded: refresh the share price right away when the ticker is known.
+    if (d?.ticker && marketConfigured) {
+      autoFetchedFor.current = d.ticker;
+      fetchPrice({ auto: true });
+    }
+    toast.success(
+      `${Object.keys(values).length} nilai diterapkan dari ${preview.file_name}` +
+        (filled.length ? `; ${filled.join(", ")} terisi otomatis.` : "."),
+    );
+    setStep(1);
+    if (!d?.ticker) requestAnimationFrame(() => document.getElementById("ticker")?.focus());
+  };
+
+  const detected = imported?.preview.detected;
+  const detectedSrc = (key: "ticker" | "company_name" | "fiscal_year" | "basis" | "period" | "sector") =>
+    detected?.[key] ? detected.sources[key] : undefined;
+  const fromFile = (key: Parameters<typeof detectedSrc>[0]) => {
+    const src = detectedSrc(key);
+    return src ? <SourceRef refText={`Terdeteksi dari ${src}`} /> : undefined;
+  };
+  const detectedCount = detected
+    ? (["ticker", "company_name", "fiscal_year", "basis"] as const).filter((k) => detected[k]).length
+    : 0;
+  const detectedNotice = imported ? (
+    detectedCount > 0 ? (
+      <Notice tone="info" icon={Info}>
+        Info di bawah terisi otomatis dari <span className="font-medium">{imported.preview.file_name}</span>. Periksa sebelum
+        lanjut{detected?.ticker ? "." : "; kode saham tidak tercantum di laporan, jadi isi 4 hurufnya."}
+      </Notice>
+    ) : (
+      <Notice tone="neutral" icon={Info}>
+        Nama perusahaan dan periode tidak terdeteksi di berkas. Isi secara manual.
+      </Notice>
+    )
+  ) : null;
+  const periodNotice = detected?.period_note ? (
+    <Notice tone="warning" icon={AlertTriangle}>
+      {detected.period_note} Pilih jenis laporan dan periode secara manual.
+    </Notice>
+  ) : null;
+
+  /** Comparative period defaults to the same period one year earlier. */
+  const syncPreviousPeriod = () => {
+    const v = getValues();
+    if (!/^\d{4}$/.test(v.fiscal_year)) return;
+    if (!v.prev_fiscal_year || Number(v.prev_fiscal_year) !== Number(v.fiscal_year) - 1) {
+      setValue("prev_fiscal_year", String(Number(v.fiscal_year) - 1));
+    }
+    setValue("prev_period", v.period);
   };
 
   const goNext = async () => {
     if (step === 0) {
+      setStep(1);
+    } else if (step === 1) {
       const ok = await trigger(STEP1_FIELDS);
       if (!ok) {
         requestAnimationFrame(() => document.querySelector<HTMLElement>('[aria-invalid="true"]')?.focus());
         return;
       }
-      const v = getValues();
-      if (!v.prev_fiscal_year || Number(v.prev_fiscal_year) !== Number(v.fiscal_year) - 1) {
-        setValue("prev_fiscal_year", String(Number(v.fiscal_year) - 1));
-      }
-      setValue("prev_period", v.period);
-      setStep(1);
-    } else if (step === 1) {
+      syncPreviousPeriod();
       setStep(2);
     } else if (step === 2) {
       const ok = await trigger();
@@ -325,19 +421,29 @@ export default function NewAnalysisPage() {
 
   return (
     <div className="mx-auto max-w-5xl">
-      <PageHeader title="Analisis baru" description="Masukkan laporan keuangan, lalu tinjau sebelum menyimpan." />
+      <PageHeader title="Analisis baru" description="Unggah laporan keuangan atau isi manual, lalu tinjau sebelum menyimpan." />
       <Stepper step={step} onJump={setStep} />
 
       <form onSubmit={(e) => e.preventDefault()} noValidate>
-        {step === 0 && (
+        {step === 1 && (
           <div className="space-y-5">
+            {detectedNotice}
+            {periodNotice}
             <Card>
               <CardHeader>
                 <CardTitle>Informasi perusahaan</CardTitle>
                 <CardDescription>Kode saham dan nama yang Anda isi belum diverifikasi terhadap data resmi BEI.</CardDescription>
               </CardHeader>
               <CardContent className="grid gap-4 sm:grid-cols-2">
-                <FieldShell id="ticker" label="Kode saham" error={errors.ticker?.message} hint="4 huruf, contoh: BBCA, TLKM">
+                <FieldShell
+                  id="ticker"
+                  label="Kode saham"
+                  error={errors.ticker?.message}
+                  hint={
+                    fromFile("ticker") ??
+                    (imported ? "Tidak tercantum di laporan. Isi 4 huruf, contoh: BBCA, TLKM" : "4 huruf, contoh: BBCA, TLKM")
+                  }
+                >
                   <Input
                     id="ticker"
                     maxLength={4}
@@ -347,13 +453,14 @@ export default function NewAnalysisPage() {
                     {...register("ticker", { setValueAs: (v: string) => v.toUpperCase() })}
                   />
                 </FieldShell>
-                <FieldShell id="name" label="Nama perusahaan" error={errors.name?.message}>
+                <FieldShell id="name" label="Nama perusahaan" error={errors.name?.message} hint={fromFile("company_name")}>
                   <Input id="name" autoComplete="off" placeholder="PT ... Tbk" aria-invalid={Boolean(errors.name)} {...register("name")} />
                 </FieldShell>
                 <FieldShell
                   id="sector"
                   label="Sektor"
                   optional
+                  hint={fromFile("sector")}
                   help="Menentukan profil penilaian. Bank dan perusahaan keuangan diperlakukan berbeda (DER dan current ratio tidak diterapkan untuk bank)."
                 >
                   <Controller
@@ -385,12 +492,13 @@ export default function NewAnalysisPage() {
                 <CardDescription>Semua nilai uang dinormalisasi ke rupiah penuh sebelum dihitung.</CardDescription>
               </CardHeader>
               <CardContent className="grid gap-4 sm:grid-cols-2 lg:grid-cols-3">
-                <FieldShell id="fiscal_year" label="Tahun fiskal" error={errors.fiscal_year?.message}>
+                <FieldShell id="fiscal_year" label="Tahun fiskal" error={errors.fiscal_year?.message} hint={fromFile("fiscal_year")}>
                   <Input id="fiscal_year" inputMode="numeric" maxLength={4} aria-invalid={Boolean(errors.fiscal_year)} {...register("fiscal_year")} />
                 </FieldShell>
                 <FieldShell
                   id="basis"
                   label="Jenis laporan"
+                  hint={fromFile("basis")}
                   help="Laporan kuartalan BEI umumnya kumulatif sejak awal tahun (mis. 9 bulan). Pilih 'per kuartal' hanya jika angka mencakup satu kuartal saja."
                 >
                   <Controller
@@ -491,7 +599,7 @@ export default function NewAnalysisPage() {
           </div>
         )}
 
-        {step === 1 && (
+        {step === 0 && (
           <div className="space-y-5">
             <div role="radiogroup" aria-label="Metode input data" className="grid gap-3 sm:grid-cols-2 lg:grid-cols-4">
               <MethodCard icon={Keyboard} title="Input manual" description="Ketik angka dari laporan keuangan." selected={method === "manual"} onSelect={() => setMethod("manual")} />
@@ -516,7 +624,8 @@ export default function NewAnalysisPage() {
             )}
             {imported && (
               <Notice tone="positive" icon={Check}>
-                Data dari <span className="font-medium">{imported.preview.file_name}</span> sudah diterapkan ke formulir.
+                Data dari <span className="font-medium">{imported.preview.file_name}</span> sudah diterapkan. Lanjut untuk
+                memeriksa info perusahaan.
               </Notice>
             )}
           </div>
@@ -547,11 +656,11 @@ export default function NewAnalysisPage() {
                   <CardTitle>Harga saham</CardTitle>
                   <CardDescription>
                     Dibutuhkan untuk PER dan PBV. Isi harga beserta tanggalnya
-                    {marketConfigured ? ", atau ambil harga penutupan terakhir dari penyedia data." : "."}
+                    {marketConfigured ? ", harga terakhir diambil otomatis dari penyedia data." : "."}
                   </CardDescription>
                 </div>
                 {marketConfigured && (
-                  <Button type="button" variant="outline" size="sm" onClick={fetchPrice} disabled={quote.isPending}>
+                  <Button type="button" variant="outline" size="sm" onClick={() => fetchPrice()} disabled={quote.isPending}>
                     {quote.isPending ? <Loader2 className="animate-spin" /> : <Download />}
                     {quote.isPending ? "Mengambil harga…" : `Ambil harga ${watch("ticker").toUpperCase()}`.trim()}
                   </Button>
@@ -567,7 +676,7 @@ export default function NewAnalysisPage() {
                   <Notice tone={priceStillFetched ? "positive" : "neutral"} icon={priceStillFetched ? Check : Info} className="sm:col-span-2">
                     {priceStillFetched ? (
                       <>
-                        Harga dari <span className="font-medium">{fetchedPrice.label}</span> ({fetchedPrice.provider_symbol}), penutupan{" "}
+                        Harga dari <span className="font-medium">{fetchedPrice.label}</span> ({fetchedPrice.provider_symbol}), harga terakhir{" "}
                         {fetchedPrice.trading_date}. Bisa tertunda; bukan harga real-time.
                       </>
                     ) : (

@@ -8,7 +8,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { Notice, errorMessage } from "@/components/ui/states";
 import { api } from "@/lib/api";
 import { formatNumber } from "@/lib/format";
-import { UNITS } from "@/lib/fields";
+import { UNITS, periodLabel } from "@/lib/fields";
 import { cn } from "@/lib/utils";
 import type { ImportPreview, ImportRow } from "@/types/api";
 
@@ -166,12 +166,23 @@ export function ImportPanel({
             </CardDescription>
           </CardHeader>
           <CardContent className="space-y-4">
-            {preview.unit && preview.unit !== formUnit && (
-              <Notice tone="warning" icon={AlertTriangle}>
-                Satuan di berkas ({unitLabel(preview.unit)}) berbeda dengan pilihan Anda di langkah 1 ({unitLabel(formUnit)}).
-                Satuan formulir akan disesuaikan dengan berkas.
-              </Notice>
-            )}
+            {(() => {
+              const d = preview.detected;
+              const items = [
+                d?.company_name,
+                d?.ticker ? `kode ${d.ticker}` : null,
+                d?.fiscal_year && d.basis ? periodLabel(d.fiscal_year, d.period ?? "FY", d.basis) : null,
+                preview.unit ? `satuan ${unitLabel(preview.unit)}` : null,
+                preview.currency,
+              ].filter(Boolean);
+              if (!items.length) return null;
+              return (
+                <Notice tone="info" icon={CheckCircle2}>
+                  Terdeteksi: <span className="font-medium">{items.join(" · ")}</span>. Info perusahaan dan periode akan terisi
+                  otomatis{formUnit && preview.unit && formUnit !== preview.unit ? ", dan satuan formulir disesuaikan dengan berkas" : ""}.
+                </Notice>
+              );
+            })()}
             {preview.errors.length > 0 && (
               <Notice tone="negative" icon={XCircle}>
                 <p className="font-medium">{preview.errors.length} baris bermasalah dan tidak digunakan:</p>

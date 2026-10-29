@@ -205,6 +205,14 @@ export const SECTORS: { value: Sector; label: string }[] = [
 
 export const sectorLabel = (s: Sector | null | undefined) => SECTORS.find((x) => x.value === s)?.label ?? "Sektor tidak diisi";
 
+export const MARKET_PROVIDER_LABELS: Record<string, string> = {
+  yahoo: "Yahoo Finance",
+  finnhub: "Finnhub",
+  goapi: "GoAPI.id",
+  alpha_vantage: "Alpha Vantage",
+};
+export const marketProviderLabel = (p: string | null | undefined) => (p ? MARKET_PROVIDER_LABELS[p] ?? p : "—");
+
 export const UNITS: { value: Unit; label: string }[] = [
   { value: "unit", label: "Satuan penuh" },
   { value: "ribu", label: "Ribuan" },

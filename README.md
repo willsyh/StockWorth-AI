@@ -54,7 +54,7 @@ With no Supabase variables, the backend runs in **local mode**: one fixed local 
 ### Verify
 
 ```bash
-cd backend && python -m pytest -q          # 143 tests: calculator, scoring, importers (CSV/XLSX/XLS/PDF), market data, AI, API
+cd backend && python -m pytest -q          # 200 tests: calculator, scoring, importers (CSV/XLSX/XLS/PDF), market data, AI, API
 cd frontend && npm run typecheck && npm run build
 curl http://localhost:8000/api/health
 ```
@@ -106,7 +106,15 @@ Keys stay on the server (never in `frontend/.env`); `/api/health` reports only w
 
 ## Share prices (market data)
 
-Set `ALPHA_VANTAGE_API_KEY` in `backend/.env` to show an **Ambil harga** button in the wizard.
+Set `MARKET_DATA_PROVIDER` in `backend/.env`. Tested on 2026-10-29 for `BBCA.JK`: **`yahoo`** works without a key
+(unofficial public endpoint: no SLA, may break or rate-limit, not for commercial use); Finnhub's free plan returns
+HTTP 403 for IDX symbols. Other options: `finnhub` + `FINNHUB_API_KEY`
+(queries `TICKER.JK`; non-US exchanges may require a paid Finnhub plan, in which case the app reports the price
+as unavailable), or `goapi` + `GOAPI_API_KEY` (from https://app.goapi.io).
+The latest price is then fetched **automatically** right after an upload when the ticker is detected, otherwise
+when the user reaches the financial-data step (once per ticker, never overwriting a typed price); **Ambil harga** refreshes it. GoAPI.id is IDX-only;
+its documentation states prices are delayed 3–10 minutes. Alpha Vantage remains available
+(`MARKET_DATA_PROVIDER=alpha_vantage`) but has no `.JK` data on the free tier.
 
 - Only IDX listings are accepted: the backend queries `TICKER.JK` and confirms through symbol
   search that the listing trades in IDR. A bare ticker is never queried: on Alpha Vantage, `BBCA`

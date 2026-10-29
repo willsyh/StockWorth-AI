@@ -252,7 +252,21 @@ export interface ImportRow {
   messages: string[];
 }
 
+export interface DetectedMetadata {
+  company_name: string | null;
+  ticker: string | null;
+  fiscal_year: number | null;
+  period: Period | null;
+  basis: Basis | null;
+  period_end: string | null;
+  sector?: Sector | null;
+  /** Set when a period end was found but its length isn't a supported annual/quarterly period. */
+  period_note?: string | null;
+  sources: Partial<Record<"company_name" | "ticker" | "fiscal_year" | "period" | "basis" | "period_end" | "sector", string>>;
+}
+
 export interface ImportPreview {
+  detected?: DetectedMetadata;
   file_name: string;
   file_type: "csv" | "xlsx" | "xls" | "pdf";
   sheet: string | null;

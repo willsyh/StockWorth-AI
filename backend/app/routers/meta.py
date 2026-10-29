@@ -29,7 +29,15 @@ def health() -> dict:
         "market_data": {
             "configured": s.market_data_configured,
             "provider": s.market_data_provider if s.market_data_configured else None,
-            "coverage_note": "Hanya kode BEI (.JK) dalam IDR yang diterima.",
+            "coverage_note": (
+                "Listing BEI (KODE.JK, bursa Jakarta, IDR). Sumber tidak resmi: bisa tertunda atau berhenti sewaktu-waktu."
+                if s.market_data_provider == "yahoo"
+                else "Harga saham BEI dalam IDR, tertunda sekitar 3–10 menit."
+                if s.market_data_provider == "goapi"
+                else "Hanya listing BEI (KODE.JK) yang diterima; ketersediaan bergantung pada paket Finnhub Anda."
+                if s.market_data_provider == "finnhub"
+                else "Hanya kode BEI (.JK) dalam IDR yang diterima."
+            ),
         },
         "max_upload_mb": round(s.max_upload_bytes / (1024 * 1024), 1),
         "max_pdf_upload_mb": round(s.max_pdf_upload_bytes / (1024 * 1024), 1),
